@@ -52,6 +52,74 @@ class DeviceReader:
         self.encryption = BluettiEncryption()
         self.encrypted_buffer = bytearray()
 
+    async def _connect(self) -> bool:
+        """Find (if needed) and connect to the device, set up the notify
+        handler and wait for the encryption handshake to complete if this
+        device requires it. Returns False if connecting failed."""
+
+        self.logger.debug("Searching for device")
+
+        if self.ble_client:
+            self.device = None
+        else:
+            self.device = await BleakScanner.find_device_by_address(
+                self.mac, timeout=5
+            )
+
+            if self.device is None:
+                self.logger.error("Device not found")
+                return False
+
+        self.logger.debug("Connecting to device")
+
+        if self.ble_client:
+            self.client = self.ble_client
+        else:
+            self.client = await establish_connection(
+                BleakClientWithServiceCache,
+                self.device,
+                self.device.name or "Unknown Device",
+                max_attempts=10,
+            )
+
+        self.logger.debug("Connected to device")
+
+        if not self.has_notifier:
+            await self.client.start_notify(
+                NOTIFY_UUID, self._notification_handler
+            )
+            self.has_notifier = True
+
+        self.logger.debug("Notification handler setup complete")
+
+        while (
+            self.config.use_encryption
+            and not self.encryption.is_ready_for_commands
+        ):
+            await asyncio.sleep(5)
+            self.logger.debug("Encryption handshake not finished yet")
+
+        return True
+
+    async def _disconnect(self):
+        """Tear down the notify handler/connection and reset encryption state."""
+
+        if self.has_notifier:
+            try:
+                await self.client.stop_notify(NOTIFY_UUID)
+                self.logger.debug("Stopped notifier")
+            except:
+                # Ignore errors here
+                pass
+            self.has_notifier = False
+        if self.client:
+            await self.client.disconnect()
+            self.logger.debug("Disconnected from device")
+
+        # Reset Encryption keys
+        self.encryption.reset()
+        self.encrypted_buffer.clear()
+
     async def read(
         self, only_registers: List[ReadableRegisters] | None = None, raw: bool = False
     ) -> dict | None:
@@ -70,47 +138,8 @@ class DeviceReader:
         async with self.polling_lock:
             try:
                 async with async_timeout.timeout(self.config.timeout):
-                    self.logger.debug("Searching for device")
-
-                    if self.ble_client:
-                        self.device = None
-                    else:
-                        self.device = await BleakScanner.find_device_by_address(
-                            self.mac, timeout=5
-                        )
-
-                        if self.device is None:
-                            self.logger.error("Device not found")
-                            return
-
-                    self.logger.debug("Connecting to device")
-
-                    if self.ble_client:
-                        self.client = self.ble_client
-                    else:
-                        self.client = await establish_connection(
-                            BleakClientWithServiceCache,
-                            self.device,
-                            self.device.name or "Unknown Device",
-                            max_attempts=10,
-                        )
-
-                    self.logger.debug("Connected to device")
-
-                    if not self.has_notifier:
-                        await self.client.start_notify(
-                            NOTIFY_UUID, self._notification_handler
-                        )
-                        self.has_notifier = True
-
-                    self.logger.debug("Notification handler setup complete")
-
-                    while (
-                        self.config.use_encryption
-                        and not self.encryption.is_ready_for_commands
-                    ):
-                        await asyncio.sleep(5)
-                        self.logger.debug("Encryption handshake not finished yet")
+                    if not await self._connect():
+                        return None
 
                     for register in registers:
                         body = register.parse_response(
@@ -176,27 +205,61 @@ class DeviceReader:
                 self.logger.warning("Unknown error %s", err)
                 return None
             finally:
-                if self.has_notifier:
-                    try:
-                        await self.client.stop_notify(NOTIFY_UUID)
-                        self.logger.debug("Stopped notifier")
-                    except:
-                        # Ignore errors here
-                        pass
-                    self.has_notifier = False
-                if self.client:
-                    await self.client.disconnect()
-                    self.logger.debug("Disconnected from device")
-
-            # Reset Encryption keys
-            self.encryption.reset()
-            self.encrypted_buffer.clear()
+                await self._disconnect()
 
             # Check if dict is empty
             if not parsed_data:
                 return None
 
             return parsed_data
+
+    async def write(self, field: str, value: Any) -> bytes | None:
+        """Write a value to a device register.
+
+        Goes through the same connect/notify/(optional) encryption-handshake
+        dance as read(), then sends the write command through the same
+        _async_send_command() path used for reads. This lets writes ride the
+        already-established encrypted session, since the device doesn't
+        distinguish encrypted reads from encrypted writes at the transport
+        level (closes #84).
+        """
+
+        available_fields = [f.name for f in self.bluetti_device.fields]
+        if field not in available_fields:
+            self.logger.error("Field not supported")
+            return None
+
+        command = self.bluetti_device.build_write_command(field, value)
+
+        if command is None:
+            self.logger.error("Field is not writeable")
+            return None
+
+        self.logger.debug("Writing device register")
+
+        async with self.polling_lock:
+            try:
+                async with async_timeout.timeout(self.config.timeout):
+                    if not await self._connect():
+                        return None
+
+                    response = await self._async_send_command(command)
+
+                    self.logger.debug("Write response: %s", response)
+
+                    return command.parse_response(response)
+
+            except TimeoutError:
+                self.logger.warning("Timeout")
+                return None
+            except BleakError as err:
+                self.logger.warning("Bleak error: %s", err)
+                return None
+            except BaseException as err:
+                self.logger.warning("Unknown error %s", err)
+                return None
+            finally:
+                await self._disconnect()
 
     async def _async_send_command(self, registers: DeviceRegister) -> bytes:
         """Send command and return response"""

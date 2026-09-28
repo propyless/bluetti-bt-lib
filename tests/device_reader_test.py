@@ -3,7 +3,7 @@ import unittest
 
 from bluetti_bt_lib.base_devices import BaseDeviceV1
 from bluetti_bt_lib import DeviceReader
-from bluetti_bt_lib.fields import FieldName
+from bluetti_bt_lib.fields import FieldName, SwitchField
 from bluetti_bt_lib.utils.bleak_client_mock import ClientMockNoEncryption
 
 
@@ -61,3 +61,34 @@ class TestDeviceReader(unittest.IsolatedAsyncioTestCase):
         data = await reader.read()
 
         self.assertIsNone(data.get(FieldName.BATTERY_SOC.value))
+
+    async def test_write_field(self):
+        device = BaseDeviceV1(
+            additional_fields=[SwitchField(FieldName.CTRL_AC, 2011)]
+        )
+        reader = DeviceReader(
+            "00:11:00:11:00:11",
+            device,
+            asyncio.Future,
+            ble_client=self.ble_mock,
+        )
+
+        response = await reader.write(FieldName.CTRL_AC.value, True)
+
+        # A real device echoes the write request back as its ack; the
+        # parsed value (last 2 bytes before the CRC) should match what we
+        # asked to write.
+        self.assertEqual(response, b"\x00\x01")
+
+    async def test_write_field_not_writeable(self):
+        device = BaseDeviceV1()
+        reader = DeviceReader(
+            "00:11:00:11:00:11",
+            device,
+            asyncio.Future,
+            ble_client=self.ble_mock,
+        )
+
+        response = await reader.write(FieldName.BATTERY_SOC.value, 1)
+
+        self.assertIsNone(response)

@@ -96,7 +96,15 @@ class BleakClientMock:
         response: bool = None,
     ) -> None:
         cmd = struct.unpack_from("!HHHH", data)
-        content = await self._get_register(cmd[1], cmd[2])
+        function_code = cmd[0] & 0xFF
+
+        if function_code == 6:
+            # Write single register (function code 6): a real device echoes
+            # the request back unchanged as its acknowledgement.
+            content = bytes(data)
+        else:
+            content = await self._get_register(cmd[1], cmd[2])
+
         await self._callback(char_specifier, content)
 
     async def _get_register(self, addr: int, size: int):

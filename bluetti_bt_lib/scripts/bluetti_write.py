@@ -6,14 +6,13 @@ import logging
 from typing import Any
 from bleak import BleakClient
 
-from ..bluetooth import DeviceWriter
+from ..bluetooth import DeviceReader, DeviceReaderConfig, DeviceWriter
 from ..utils.device_builder import build_device
 
 
 async def async_write(
     address: str, type: str, encryption: bool, field: str, value: Any
 ):
-    client = BleakClient(address)
     built = build_device(type + "12345678")
 
     if built is None:
@@ -21,8 +20,22 @@ async def async_write(
         return
 
     if encryption:
-        print("Encryption is not supported")
+        # Encrypted devices need the full connect/handshake dance that
+        # DeviceReader already implements, so writes ride the same
+        # encrypted session as reads.
+        print("Reader created (encrypted)")
+
+        reader = DeviceReader(
+            address,
+            built,
+            asyncio.Future,
+            DeviceReaderConfig(use_encryption=True),
+        )
+
+        await reader.write(field, value)
         return
+
+    client = BleakClient(address)
 
     print("Client created")
 
